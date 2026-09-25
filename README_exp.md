@@ -7,6 +7,39 @@ else is a zoom-in on one step of that flow.
 
 ---
 
+## What this project does
+
+AutoTriage is a working, self-contained demo of an AI on-call agent: a small app is broken on
+purpose, a CloudWatch alarm notices, and instead of paging a human at 3am, a Lambda function
+gathers the evidence, asks Claude to diagnose it, and — only within tightly bounded limits —
+fixes it automatically. Concretely, it's built from three cooperating pieces:
+
+1. **Something to break.** A FastAPI app running in a single Docker container on one EC2
+   instance, with a handful of "chaos" endpoints (`/chaos/500`, `/chaos/crash`, `/chaos/disk`)
+   that each simulate a realistic, distinct on-call incident — a stuck error state, a crashed
+   process, and a full disk — plus a `/chaos/reset` to undo it manually.
+2. **Something that notices and decides.** CloudWatch alarms watch the app's logs and metrics,
+   and route any trip through SNS to a Python Lambda. That Lambda pulls together the last 15
+   minutes of logs, recent metrics, and a written runbook, hands all of it to Claude (via
+   Bedrock) as context, and gets back a structured verdict: what's wrong, how confident it is,
+   how risky a fix would be, and which (if any) of exactly two pre-approved fixes to apply.
+3. **Something that keeps it honest.** A policy gate only lets that verdict auto-execute if
+   confidence and risk both clear a bar, and only if the same alarm hasn't already been
+   auto-fixed in the last 30 minutes; the fix itself can only run via one of two pre-defined SSM
+   documents against one specific tagged instance — never an arbitrary command. After acting, the
+   Lambda re-checks the alarm itself rather than trusting the fix worked, escalates to a human by
+   email whenever it's not confident or the fix didn't hold, and writes a permanent record of
+   every decision (DynamoDB) plus a human-readable RCA (S3), whether or not it acted.
+
+Everything — the app, the Lambda, the alarms, the IAM policies, the SSM documents — is defined
+as Terraform, so the whole thing is reproducible with `terraform apply` and disposable with
+`terraform destroy`. The point of the project is less "here's a chatbot that restarts servers"
+and more "here's what it actually takes to let an LLM take automated action safely": strict
+output validation, a narrow allowlist of actions, independent verification that a fix worked,
+rate limiting to prevent fix loops, and a paper trail for every single decision — auto or not.
+
+---
+
 ## How a single incident flows through the system
 
 Walk through one concrete case: someone calls `POST /chaos/500`.
