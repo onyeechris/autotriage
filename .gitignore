@@ -1,2 +1,9 @@
 .idea/
 .venv/
+
+# Terraform
+terraform/.terraform/
+terraform/build/
+*.tfstate
+*.tfstate.*
+terraform/*.tfplan

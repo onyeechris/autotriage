@@ -1,0 +1,32 @@
+schemaVersion: '2.2'
+description: Remove AutoTriage chaos disk junk and prune unused Docker data to recover from a disk-usage alarm.
+parameters:
+  ContainerName:
+    type: String
+    default: autotriage-app
+    description: Name of the demo app container, used to reset its in-memory chaos flag after cleanup
+mainSteps:
+  - action: aws:runShellScript
+    name: PruneDisk
+    inputs:
+      runCommand:
+        - |
+          set -euo pipefail
+          NAME="{{ ContainerName }}"
+
+          echo "Disk usage before cleanup:"
+          df -h /
+
+          echo "Removing chaos junk files from /tmp"
+          rm -f /tmp/autotriage-chaos-junk-* || true
+
+          echo "Pruning unused docker images, containers, and volumes"
+          docker system prune -f --volumes || true
+
+          if [ -n "$(docker ps -q -f "name=^$NAME$" -f status=running)" ]; then
+            echo "Resetting app chaos flag"
+            curl -sf -X POST http://localhost:8000/chaos/reset || echo "reset call failed" >&2
+          fi
+
+          echo "Disk usage after cleanup:"
+          df -h /

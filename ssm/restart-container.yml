@@ -1,0 +1,32 @@
+schemaVersion: '2.2'
+description: Restart the AutoTriage demo app container. Fixes both a crashed container and the /chaos/500 stuck-flag case.
+parameters:
+  ContainerName:
+    type: String
+    default: autotriage-app
+    description: Name of the docker container to restart
+mainSteps:
+  - action: aws:runShellScript
+    name: RestartContainer
+    inputs:
+      runCommand:
+        - |
+          set -euo pipefail
+          NAME="{{ ContainerName }}"
+          echo "Target container: $NAME"
+
+          ID=$(docker ps -aq -f "name=^$NAME$")
+          if [ -z "$ID" ]; then
+            echo "Container $NAME does not exist" >&2
+            exit 1
+          fi
+
+          docker restart "$NAME"
+          sleep 3
+
+          RUNNING=$(docker ps -q -f "name=^$NAME$" -f status=running)
+          if [ -z "$RUNNING" ]; then
+            echo "Container $NAME failed to come back up" >&2
+            exit 1
+          fi
+          echo "Container $NAME is running"
