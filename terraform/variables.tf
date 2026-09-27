@@ -38,10 +38,16 @@ variable "alert_email" {
   type        = string
 }
 
-variable "bedrock_model_id" {
-  description = "Bedrock model id (or inference-profile id) the triage Lambda calls for the JSON verdict"
+variable "anthropic_model" {
+  description = "Anthropic model id the triage Lambda calls directly via the Messages API (see https://docs.anthropic.com/en/docs/about-claude/models for current ids)"
   type        = string
-  default     = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+  default     = "claude-3-5-sonnet-20241022"
+}
+
+variable "anthropic_api_key_parameter_name" {
+  description = "SSM Parameter Store name (SecureString) holding the Anthropic API key. Terraform creates the parameter but never sets its real value -- set that out-of-band (see README)."
+  type        = string
+  default     = "/autotriage/anthropic-api-key"
 }
 
 variable "dry_run" {

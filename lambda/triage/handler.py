@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import time
+import urllib.error
+import urllib.request
 import uuid
 
 import boto3
@@ -21,18 +23,30 @@ INSTANCE_ID = os.environ["INSTANCE_ID"]
 S3_BUCKET = os.environ["S3_BUCKET"]
 RUNBOOK_KEY = os.environ.get("RUNBOOK_KEY", "runbooks/runbook.md")
 DYNAMODB_TABLE = os.environ["DYNAMODB_TABLE"]
-BEDROCK_MODEL_ID = os.environ["BEDROCK_MODEL_ID"]
+ANTHROPIC_MODEL = os.environ["ANTHROPIC_MODEL"]
+ANTHROPIC_API_KEY_PARAM = os.environ["ANTHROPIC_API_KEY_PARAM"]
 ESCALATION_TOPIC_ARN = os.environ["ESCALATION_TOPIC_ARN"]
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 POST_ACTION_WAIT_SECONDS = int(os.environ.get("POST_ACTION_WAIT_SECONDS", "120"))
+
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_VERSION = "2023-06-01"
 
 logs_client = boto3.client("logs")
 cloudwatch_client = boto3.client("cloudwatch")
 s3_client = boto3.client("s3")
 ssm_client = boto3.client("ssm")
 sns_client = boto3.client("sns")
-bedrock_client = boto3.client("bedrock-runtime")
 dynamodb_table = boto3.resource("dynamodb").Table(DYNAMODB_TABLE)
+
+
+def _load_anthropic_api_key() -> str:
+    response = ssm_client.get_parameter(Name=ANTHROPIC_API_KEY_PARAM, WithDecryption=True)
+    return response["Parameter"]["Value"]
+
+
+# Fetched once per cold start, like the boto3 clients above -- every warm invocation reuses it.
+ANTHROPIC_API_KEY = _load_anthropic_api_key()
 
 
 def now_iso() -> str:
@@ -42,13 +56,36 @@ def now_iso() -> str:
 def call_claude(alarm_name: str, alarm_reason: str, logs: str, metrics: str, runbook: str):
     """Returns (verdict_dict, None) on success, or (None, error_message) on any failure."""
     user_prompt = build_user_prompt(alarm_name, alarm_reason, logs, metrics, runbook)
-    response = bedrock_client.converse(
-        modelId=BEDROCK_MODEL_ID,
-        system=[{"text": SYSTEM_PROMPT}],
-        messages=[{"role": "user", "content": [{"text": user_prompt}]}],
-        inferenceConfig={"maxTokens": 1024, "temperature": 0.0},
+    payload = json.dumps(
+        {
+            "model": ANTHROPIC_MODEL,
+            "max_tokens": 1024,
+            "temperature": 0.0,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        ANTHROPIC_API_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": ANTHROPIC_API_VERSION,
+            "content-type": "application/json",
+        },
     )
-    raw_text = response["output"]["message"]["content"][0]["text"].strip()
+    try:
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:500]
+        return None, f"Anthropic API returned HTTP {exc.code}: {detail}"
+    except urllib.error.URLError as exc:
+        return None, f"failed to reach the Anthropic API: {exc.reason}"
+
+    raw_text = body["content"][0]["text"].strip()
 
     if raw_text.startswith("```"):
         raw_text = raw_text.strip("`")

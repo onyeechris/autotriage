@@ -37,3 +37,7 @@ output "artifacts_bucket" {
 output "app_log_group" {
   value = aws_cloudwatch_log_group.app.name
 }
+
+output "anthropic_api_key_parameter_name" {
+  value = aws_ssm_parameter.anthropic_api_key.name
+}

@@ -11,7 +11,7 @@ EC2 (Docker FastAPI app + CloudWatch agent)
    ▼
 CloudWatch Alarm ──► SNS ──► Lambda: triage-agent
                                  │ 1. gather context (logs, metrics, runbook)
-                                 │ 2. Claude (Bedrock) → structured JSON verdict
+                                 │ 2. Claude (Anthropic API) → structured JSON verdict
                                  │ 3. policy gate (allowlist + confidence + risk)
                                  ├──► auto-fix via SSM Run Command ──► verify ──► escalate if not recovered
                                  └──► needs approval → SNS email
@@ -56,8 +56,7 @@ autotriage/
 ## Deploying
 
 Prerequisites: Terraform >= 1.5, AWS credentials for the target account, an existing EC2 key
-pair in the target region, and Bedrock model access enabled for the model in `bedrock_model_id`
-(Bedrock model access is granted per-account/region in the Bedrock console before first use).
+pair in the target region, and an [Anthropic API key](https://console.anthropic.com/).
 
 ```bash
 cd terraform
@@ -66,6 +65,18 @@ terraform apply \
   -var="key_name=<your-ec2-key-pair-name>" \
   -var="alert_email=<you@example.com>" \
   -var="ssh_ingress_cidr=<your-ip>/32"
+```
+
+Terraform creates the SSM parameter that holds the Anthropic API key, but deliberately never
+writes the real key into it (Terraform state is not a safe place for a live secret). Set the
+real value once, after the first apply, directly via the AWS CLI:
+
+```bash
+aws ssm put-parameter \
+  --name "$(terraform -chdir=terraform output -raw anthropic_api_key_parameter_name)" \
+  --type SecureString \
+  --value "sk-ant-..." \
+  --overwrite
 ```
 
 `dry_run` defaults to `true`. Flip it once you've watched a full dry-run cycle end to end:
@@ -325,7 +336,18 @@ Two things that trip people up here:
   heartbeat cron stops reporting entirely (e.g. the whole instance is down, not just the
   container), that absence should itself count as "not running."
 
-### 12. IAM role — triage Lambda
+### 12. Store the Anthropic API key
+
+**Systems Manager → Parameter Store → Create parameter**
+- Name: `/autotriage/anthropic-api-key`
+- Type: **SecureString** (use the default `aws/ssm` KMS key)
+- Value: your real [Anthropic API key](https://console.anthropic.com/)
+- Create parameter
+
+The Lambda reads this parameter (decrypted) once per cold start rather than having the key baked
+into an environment variable in plaintext.
+
+### 13. IAM role — triage Lambda
 
 **IAM → Roles → Create role**
 - Trusted entity type: **AWS service** → Use case: **Lambda**
@@ -370,13 +392,16 @@ Open the new role → **Add permissions → Create inline policy → JSON tab**,
       "Resource": "arn:aws:sns:<REGION>:<ACCOUNT_ID>:autotriage-escalation"
     },
     {
-      "Sid": "InvokeClaude",
+      "Sid": "ReadAnthropicApiKey",
       "Effect": "Allow",
-      "Action": ["bedrock:InvokeModel"],
-      "Resource": [
-        "arn:aws:bedrock:<REGION>::foundation-model/<BEDROCK_MODEL_ID>",
-        "arn:aws:bedrock:<REGION>:<ACCOUNT_ID>:inference-profile/*"
-      ]
+      "Action": ["ssm:GetParameter"],
+      "Resource": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/autotriage/anthropic-api-key"
+    },
+    {
+      "Sid": "DecryptAnthropicApiKey",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt"],
+      "Resource": "*"
     },
     {
       "Sid": "RunRemediation",
@@ -399,9 +424,12 @@ Open the new role → **Add permissions → Create inline policy → JSON tab**,
 ```
 
 This is the same policy `terraform/iam.tf` generates — the console just needs literal ARNs where
-Terraform could reference other resources by name.
+Terraform could reference other resources by name. `DecryptAnthropicApiKey` uses `"*"` rather
+than a specific key ARN because the parameter above uses the AWS-managed `aws/ssm` key, and IAM
+doesn't support scoping `kms:Decrypt` to a key by its alias; `ReadAnthropicApiKey` above it is
+what actually limits which secret can be read.
 
-### 13. Package and create the Lambda function
+### 14. Package and create the Lambda function
 
 Locally, zip the Lambda source (the console needs a `.zip`, not a folder):
 
@@ -420,8 +448,8 @@ Then:
 - **Code** tab → **Upload from** → **.zip file** → select `triage_lambda.zip` → Save
 - **Runtime settings → Edit** → Handler: `handler.lambda_handler` → Save
 - **Configuration → General configuration → Edit** → Memory: `256` MB, Timeout: `8` min `0` sec
-  (480s — covers the Logs Insights query, the Bedrock call, up to 90s of SSM polling, and the
-  120s post-action wait) → Save
+  (480s — covers the Logs Insights query, the Anthropic API call, up to 90s of SSM polling, and
+  the 120s post-action wait) → Save
 - **Configuration → Environment variables → Edit**, add:
 
   | Key | Value |
@@ -431,14 +459,15 @@ Then:
   | `S3_BUCKET` | `autotriage-artifacts-<ACCOUNT_ID>` |
   | `RUNBOOK_KEY` | `runbooks/runbook.md` |
   | `DYNAMODB_TABLE` | `autotriage-audit-log` |
-  | `BEDROCK_MODEL_ID` | `anthropic.claude-3-5-sonnet-20241022-v2:0` (or whichever you enabled) |
+  | `ANTHROPIC_MODEL` | `claude-3-5-sonnet-20241022` (or whichever model you're using) |
+  | `ANTHROPIC_API_KEY_PARAM` | `/autotriage/anthropic-api-key` |
   | `ESCALATION_TOPIC_ARN` | `arn:aws:sns:<REGION>:<ACCOUNT_ID>:autotriage-escalation` |
   | `SSM_DOC_RESTART` | `autotriage-restart-container` |
   | `SSM_DOC_PRUNE` | `autotriage-prune-disk` |
   | `DRY_RUN` | `true` |
   | `POST_ACTION_WAIT_SECONDS` | `120` |
 
-### 14. Wire the trigger topic to the Lambda
+### 15. Wire the trigger topic to the Lambda
 
 **Lambda → `autotriage-triage` → Add trigger → SNS → Topic: `autotriage-triage-trigger` → Add.**
 
@@ -446,12 +475,6 @@ This one click does two things Terraform does as two separate resources
 (`aws_sns_topic_subscription` + `aws_lambda_permission`): it subscribes the function to the
 topic, *and* it grants SNS the resource-based permission to actually invoke it. Both are
 required; the console just bundles them.
-
-### 15. Enable Bedrock model access
-
-**Bedrock → Model access → Manage model access**, enable the Anthropic model matching
-`BEDROCK_MODEL_ID` above, and save. This is an account/region-level, one-time grant — activation
-can take a few minutes.
 
 ### 16. Test it
 
@@ -475,7 +498,8 @@ will simply refuse to delete out of order:
 2. SNS subscriptions, then both topics (`autotriage-triage-trigger`, `autotriage-escalation`)
 3. CloudWatch alarms (all three) and the `/autotriage/app` log group (deleting the log group also
    removes its metric filter)
-4. SSM documents (`autotriage-restart-container`, `autotriage-prune-disk`)
+4. SSM documents (`autotriage-restart-container`, `autotriage-prune-disk`) and the Parameter
+   Store parameter `/autotriage/anthropic-api-key`
 5. EC2 instance (terminate `autotriage-app`), then the `autotriage-app-sg` security group
 6. IAM roles `autotriage-ec2-role` and `autotriage-triage-lambda-role` (detach/delete their
    inline and managed policies first if the console asks)
@@ -545,8 +569,9 @@ Watch it end to end:
   paper over them with automation.
 - **VPC-scoped Lambda + direct health check** as a second recovery signal alongside the
   CloudWatch alarm re-check, to catch cases where the alarm's evaluation window lags real recovery.
-- Move the Bedrock model id to an inference profile ARN and add a CloudWatch alarm on the
-  triage Lambda's own error rate, so a broken triage pipeline pages a human too.
+- Rotate the Anthropic API key via Secrets Manager (with automatic rotation) instead of a static
+  SSM SecureString, and add a CloudWatch alarm on the triage Lambda's own error rate, so a
+  broken triage pipeline pages a human too.
 
 ## Cleanup (Terraform)
 

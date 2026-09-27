@@ -99,13 +99,20 @@ resource "aws_iam_role_policy" "lambda_triage" {
         Resource = aws_sns_topic.escalation.arn
       },
       {
-        Sid    = "InvokeClaude"
-        Effect = "Allow"
-        Action = ["bedrock:InvokeModel"]
-        Resource = [
-          "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.bedrock_model_id}",
-          "arn:aws:bedrock:${var.aws_region}:${local.account_id}:inference-profile/*",
-        ]
+        Sid      = "ReadAnthropicApiKey"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = aws_ssm_parameter.anthropic_api_key.arn
+      },
+      {
+        # The parameter above uses the AWS-managed "aws/ssm" key. IAM does not let you scope
+        # kms:Decrypt to a key by its alias ARN (aliases aren't a valid Resource for crypto
+        # operations), so this is the tightest expressible grant; the ReadAnthropicApiKey
+        # statement above already limits *which parameter* can be read in the first place.
+        Sid      = "DecryptAnthropicApiKey"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = "*"
       },
       {
         Sid    = "RunRemediation"

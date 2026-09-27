@@ -20,8 +20,8 @@ fixes it automatically. Concretely, it's built from three cooperating pieces:
    process, and a full disk — plus a `/chaos/reset` to undo it manually.
 2. **Something that notices and decides.** CloudWatch alarms watch the app's logs and metrics,
    and route any trip through SNS to a Python Lambda. That Lambda pulls together the last 15
-   minutes of logs, recent metrics, and a written runbook, hands all of it to Claude (via
-   Bedrock) as context, and gets back a structured verdict: what's wrong, how confident it is,
+   minutes of logs, recent metrics, and a written runbook, hands all of it to Claude (via the
+   Anthropic API) as context, and gets back a structured verdict: what's wrong, how confident it is,
    how risky a fix would be, and which (if any) of exactly two pre-approved fixes to apply.
 3. **Something that keeps it honest.** A policy gate only lets that verdict auto-execute if
    confidence and risk both clear a bar, and only if the same alarm hasn't already been
@@ -75,10 +75,11 @@ Walk through one concrete case: someone calls `POST /chaos/500`.
    the last 15 minutes of logs (via CloudWatch Logs Insights), recent CPU/disk/heartbeat metrics,
    and the runbook text from S3.
 
-8. **The Lambda asks Claude.** It builds a prompt (`prompts.py`) from that evidence and calls
-   Bedrock's `converse` API with a system prompt that hard-constrains the output to one JSON
-   object with exactly six fields (`summary`, `root_cause`, `confidence`, `action`, `risk`,
-   `evidence`).
+8. **The Lambda asks Claude.** It builds a prompt (`prompts.py`) from that evidence and POSTs it
+   straight to the Anthropic Messages API (`https://api.anthropic.com/v1/messages`) over
+   `urllib`, with a system prompt that hard-constrains the output to one JSON object with exactly
+   six fields (`summary`, `root_cause`, `confidence`, `action`, `risk`, `evidence`). The API key
+   itself is fetched once per cold start from an SSM SecureString parameter, never hardcoded.
 
 9. **The verdict gets validated, not trusted.** `policy.validate_verdict` checks the JSON has the
    right shape, the right keys, an allowlisted (or `"none"`) action, a numeric confidence in
@@ -310,6 +311,10 @@ The orchestrator; ties every other module together into `lambda_handler(event, c
   performance convention — every subsequent invocation on a warm container reuses them). This
   also means the function will fail fast at import time if a required env var is missing, which
   is intentional: better a clear cold-start failure than a confusing `KeyError` mid-triage.
+  `_load_anthropic_api_key()` follows the same pattern: it calls `ssm:GetParameter` with
+  `WithDecryption=True` exactly once per cold start and caches the result in the module-level
+  `ANTHROPIC_API_KEY` — the key is never written to an environment variable (which would show up
+  in plaintext in the Lambda console and in `DescribeFunctionConfiguration` API responses).
 - `lambda_handler` iterates `event["Records"]` (SNS can, in principle, batch multiple messages
   into one Lambda invocation) — for each one, it unpacks the CloudWatch Alarm JSON that SNS
   wrapped, and calls `handle_alarm`. A broad `except Exception` around that call means a bug in
@@ -320,12 +325,18 @@ The orchestrator; ties every other module together into `lambda_handler(event, c
   context → `call_claude` → validate → check rate limit → `decide` → (if `"auto"`) run the
   action, wait, re-check the alarm → write the audit log entry → write the RCA → return a result
   dict.
-- `call_claude` also handles one Bedrock-specific rough edge: some models occasionally wrap JSON
-  in markdown code fences even when told not to, so there's a small `strip("`")` /
-  `raw_text[4:]` cleanup before `json.loads`. If parsing still fails, or `validate_verdict`
-  rejects the result, `call_claude` returns `(None, error_string)` and `handle_alarm` escalates
-  immediately without ever reaching the policy gate — matching the "invalid LLM JSON → escalate,
-  never guess" guardrail verbatim.
+- `call_claude` builds the request body itself (model, `max_tokens`, `temperature: 0.0`, the
+  system prompt, and the user message) and POSTs it via `urllib.request` — there's no `anthropic`
+  SDK dependency to vendor into the Lambda zip, just the standard library, which is also why
+  `terraform/lambda.tf`'s `archive_file` can zip the source directory as-is with no separate
+  `pip install --target` build step. `urllib.error.HTTPError`/`URLError` are caught explicitly so
+  a network hiccup or an API error response becomes a normal `(None, error_string)` escalation
+  rather than an uncaught exception. It also handles one rough edge common to LLM JSON output:
+  models occasionally wrap JSON in markdown code fences even when told not to, so there's a small
+  `strip("`")` / `raw_text[4:]` cleanup before `json.loads`. If parsing still fails, or
+  `validate_verdict` rejects the result, `call_claude` returns `(None, error_string)` and
+  `handle_alarm` escalates immediately without ever reaching the policy gate — matching the
+  "invalid LLM JSON → escalate, never guess" guardrail verbatim.
 - DynamoDB's `timestamp` attribute is deliberately never referenced inside a
   `KeyConditionExpression`/`FilterExpression` string in this file — `timestamp` is a DynamoDB
   *reserved word*, and reserved words are only a problem inside expression strings (not as
@@ -360,7 +371,8 @@ Every knob the rest of the config reads. Two have no default and must be supplie
 — `key_name` (an EC2 key pair that has to already exist in the target account/region; Terraform
 doesn't create one for you here) and `alert_email` (who gets escalation emails). Everything else
 defaults to something reasonable for a quick demo: `us-east-1`, `t3.micro`, `dry_run = true`,
-and a specific Bedrock model id you can override without touching any `.tf` file.
+a specific Anthropic model id you can override without touching any `.tf` file, and the SSM
+parameter name (`/autotriage/anthropic-api-key`) the Lambda reads its API key from.
 
 ### `data.tf`
 
@@ -409,6 +421,18 @@ is the Terraform-side half of "only two pre-defined SSM documents" — their nam
 (`<project>-restart-container`, `<project>-prune-disk`) get passed into the Lambda's environment
 in `lambda.tf`, and their ARNs get named explicitly in the Lambda's IAM policy in `iam.tf`.
 
+### `secrets.tf`
+
+One resource: an `aws_ssm_parameter` (type `SecureString`) that holds the Anthropic API key.
+The interesting part is what it *doesn't* do — `value = "REPLACE_ME"` combined with
+`lifecycle { ignore_changes = [value] }` means Terraform creates the parameter (so its name and
+ARN exist and are stable for `iam.tf` and `lambda.tf` to reference) but then permanently stops
+caring what value lives in it. You set the real key once, out-of-band, via `aws ssm
+put-parameter --overwrite` (see `README.md`), and every subsequent `terraform apply` leaves it
+alone instead of clobbering a live key back to the placeholder. The alternative — passing the
+real key in as a `sensitive` Terraform variable — would still leave it sitting in plaintext
+inside the Terraform state file; keeping it out of Terraform's hands entirely avoids that.
+
 ### `alarms.tf`
 
 The CloudWatch log group, one metric filter, and three alarms — all described in detail in the
@@ -441,13 +465,17 @@ resource-level scoping, so `"*"` here isn't a shortcut, it's close to the tighte
 expressible); `s3:GetObject`/`PutObject` scoped to `<bucket-arn>/*`, not the whole account;
 `dynamodb:PutItem`/`Query` scoped to exactly the one table ARN; `sns:Publish` scoped to exactly
 the escalation topic (notably *not* the trigger topic — the Lambda only ever publishes to
-escalation, never back to trigger); `bedrock:InvokeModel` scoped to the specific model ARN (plus
-a wildcard inference-profile ARN, since Bedrock model access is sometimes granted via an
-inference profile rather than a bare foundation-model ARN, depending on model and region); and
-the guardrail statement, `ssm:SendCommand` scoped to a `Resource` list containing *only* the two
-document ARNs and the one instance ARN — not `"*"`, not "any instance with this tag," but this
-literal instance, created by this literal Terraform config, referenced by its actual resource
-ID (`aws_instance.app.arn`).
+escalation, never back to trigger); `ssm:GetParameter` scoped to exactly the one SSM parameter
+holding the Anthropic API key (`aws_ssm_parameter.anthropic_api_key.arn` — see `secrets.tf`),
+paired with a `kms:Decrypt` statement that has to use `Resource: "*"` for a narrower reason than
+the read-only APIs above: the parameter uses the AWS-managed `aws/ssm` key, and IAM simply
+doesn't support scoping `kms:Decrypt` to a key by its alias ARN — the `GetParameter` statement
+right above it is what actually limits *which* secret can be decrypted, this one just grants the
+mechanical ability to decrypt whatever `GetParameter` already let through; and the guardrail
+statement, `ssm:SendCommand` scoped to a `Resource` list containing *only* the two document ARNs
+and the one instance ARN — not `"*"`, not "any instance with this tag," but this literal
+instance, created by this literal Terraform config, referenced by its actual resource ID
+(`aws_instance.app.arn`).
 
 ### `ec2.tf`
 
@@ -497,12 +525,13 @@ needing that escaping at all.
 `__pycache__`) into `terraform/build/triage_lambda.zip`. `aws_lambda_function.triage` deploys
 that zip with `handler.lambda_handler` as the entry point, Python 3.12, 256 MB memory, and a
 480-second timeout — sized generously because a single invocation can spend up to ~15s on the
-Logs Insights query, several seconds on the Bedrock call, up to 90s polling an SSM command, and
-then a full 120s post-action wait before re-checking the alarm; 480s leaves headroom above that
-worst case. Every environment variable `handler.py` reads (`os.environ[...]`) is set here,
+Logs Insights query, a few seconds on the Anthropic API call, up to 90s polling an SSM command,
+and then a full 120s post-action wait before re-checking the alarm; 480s leaves headroom above
+that worst case. Every environment variable `handler.py` reads (`os.environ[...]`) is set here,
 pulling real values from other resources — the log group's actual name, the instance's actual
-ID, the bucket's actual name, and so on — so nothing in the Lambda code hardcodes a resource
-name that Terraform might change. `aws_lambda_permission.allow_sns` and
+ID, the bucket's actual name, the Anthropic API key parameter's actual name, and so on — so
+nothing in the Lambda code hardcodes a resource name that Terraform might change.
+`aws_lambda_permission.allow_sns` and
 `aws_sns_topic_subscription.triage_lambda` are the two halves of "SNS can invoke this Lambda":
 the subscription says "deliver messages here," the permission is the resource-based policy that
 actually authorizes SNS to call `lambda:InvokeFunction` — both are required, one alone isn't
@@ -512,9 +541,10 @@ enough.
 
 The values you actually need after `terraform apply` finishes: the instance's ID and public IP,
 a ready-to-copy SSH command, the app's base URL (used directly by the `curl` commands in
-`README.md`), both SNS topic ARNs, the Lambda's name, and the DynamoDB table / S3 bucket / log
-group names — everything you'd otherwise have to go find in the AWS console to verify the system
-end to end.
+`README.md`), both SNS topic ARNs, the Lambda's name, the DynamoDB table / S3 bucket / log group
+names, and the Anthropic API key parameter's name (used directly by the `aws ssm put-parameter`
+command in `README.md` that sets the real key after the first apply) — everything you'd otherwise
+have to go find in the AWS console to verify the system end to end.
 
 ---
 
