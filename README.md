@@ -435,7 +435,7 @@ Locally, zip the Lambda source (the console needs a `.zip`, not a folder):
 
 ```bash
 cd lambda/triage
-zip -r ../../triage_lambda.zip . -x "requirements.txt"
+zip -r ../../triage_lambda.zip . -x "requirements.txt" -x "README.md"
 cd ../..
 ```
 

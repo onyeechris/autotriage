@@ -2,7 +2,7 @@ data "archive_file" "triage_lambda" {
   type        = "zip"
   source_dir  = "${path.module}/../lambda/triage"
   output_path = "${path.module}/build/triage_lambda.zip"
-  excludes    = ["requirements.txt", "__pycache__"]
+  excludes    = ["requirements.txt", "README.md", "__pycache__"]
 }
 
 resource "aws_lambda_function" "triage" {
