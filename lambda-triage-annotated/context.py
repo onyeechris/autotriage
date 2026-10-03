@@ -121,9 +121,17 @@ def get_recent_metrics(cloudwatch_client, instance_id: str) -> str:
                     # A different namespace: metrics published by the CloudWatch agent running ON
                     # the instance itself (things EC2 doesn't track by default, like disk usage).
                     "MetricName": "disk_used_percent",
-                    "Dimensions": [{"Name": "InstanceId", "Value": instance_id}, {"Name": "path", "Value": "/"}],
-                    # Two dimensions this time: which instance, AND which disk path ("/", the root
-                    # filesystem) -- the CloudWatch agent can report on more than one path.
+                    "Dimensions": [
+                        {"Name": "InstanceId", "Value": instance_id},
+                        # Which instance...
+                        {"Name": "path", "Value": "/"},
+                        # ...which disk path ("/", the root filesystem)...
+                        {"Name": "fstype", "Value": "xfs"},
+                        # ...and which filesystem type. The agent always publishes all three, and a
+                        # metric is only found when every dimension matches exactly, so omitting
+                        # fstype here would silently return no data. (Same three dimensions as
+                        # the disk-high alarm in terraform/alarms.tf.)
+                    ],
                 },
                 "Period": 300,
                 "Stat": "Average",
@@ -149,7 +157,11 @@ def get_recent_metrics(cloudwatch_client, instance_id: str) -> str:
     ]
     try:
         response = cloudwatch_client.get_metric_data(
-            MetricDataQueries=queries, StartTime=start_time, EndTime=end_time
+            MetricDataQueries=queries, StartTime=start_time, EndTime=end_time,
+            ScanBy="TimestampAscending",
+            # By default CloudWatch returns the newest datapoint first. Ask for oldest-first so the
+            # list reads like a timeline. Otherwise the model sees the pre-crash "1.0" values at
+            # the end of the list and wrongly concludes the container has recovered.
         )
         # Send all three queries to AWS in one request, and get all three sets of results back
         # together in one response.
@@ -163,12 +175,17 @@ def get_recent_metrics(cloudwatch_client, instance_id: str) -> str:
     lines = []
     for result in response.get("MetricDataResults", []):
         # Loop over each of the three query results in the response.
-        values = ", ".join(f"{v:.1f}" for v in result.get("Values", []))
-        # A "generator expression" feeding straight into join(): for every number v in this
-        # metric's list of values, format it as text with exactly 1 decimal place (":.1f"), then
-        # glue all of them together separated by ", ".
-        lines.append(f"{result['Id']}: [{values or 'no data points'}]")
-        # Build a line like "cpu: [12.3, 14.1]", or "cpu: [no data points]" if there was nothing.
+        points = ", ".join(
+            f"{ts:%H:%M}={v:.1f}" for ts, v in zip(result.get("Timestamps", []), result.get("Values", []))
+        )
+        # zip() pairs each timestamp with its value. For each pair, the f-string writes the time as
+        # HH:MM (":%H:%M" is a datetime format) and the value with 1 decimal place, giving text
+        # like "17:12=0.0". join() glues the pairs together with ", ".
+        latest = f"latest={result['Values'][-1]:.1f}" if result.get("Values") else "latest=none"
+        # The most recent value on its own line, so the model doesn't have to work it out from a
+        # long list. [-1] is Python's way of saying "the last item in the list".
+        lines.append(f"{result['Id']} ({latest}), oldest->newest UTC: [{points or 'no data points'}]")
+        # One line per metric, e.g. "container_running (latest=0.0), oldest->newest UTC: [17:10=1.0, 17:12=0.0]".
     return "\n".join(lines)
     # Join every metric's line into one multi-line string to hand back to the caller.
 

@@ -47,7 +47,7 @@ def decide(verdict: dict, rate_limited: bool) -> tuple[str, str]:
         return "escalate", f"action {action!r} is not allowlisted"
 
     if rate_limited:
-        return "approval", "auto-remediation rate limit reached for this alarm in the last 30 minutes"
+        return "approval", "auto-remediation rate limit reached for this alarm in the last rate-limit window"
 
     if confidence >= CONFIDENCE_THRESHOLD and risk == "low":
         return "auto", "confidence and risk within policy for automatic remediation"

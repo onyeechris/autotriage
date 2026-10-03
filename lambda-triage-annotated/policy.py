@@ -3,7 +3,8 @@
 Guardrails encoded here (see AUTOTRIAGE.md):
 - only restart_container / prune_disk are ever auto-run, and only via pre-defined SSM documents
 - auto-run requires confidence >= 0.8 AND risk == "low"
-- at most one auto-remediation per alarm per 30 minutes, to avoid fix loops
+- at most one auto-remediation per alarm per rate-limit window (30 minutes by default, set with
+  the RATE_LIMIT_WINDOW_MINUTES env var; 5 in the current test deployment), to avoid fix loops
 - invalid or unrecognized LLM output always escalates -- never guess
 """
 # Everything between the triple quotes at the very top of the file is a "module docstring" -- a
@@ -14,6 +15,8 @@ import datetime as dt
 # "import" brings in code someone else already wrote so we can reuse it. "datetime" is one of
 # Python's built-in modules, for working with dates and times. "as dt" gives it a short nickname
 # so we can write dt.datetime instead of datetime.datetime everywhere below.
+import os
+# Built-in module for reading environment variables (the rate-limit window is set that way).
 
 ALLOWLISTED_ACTIONS = {"restart_container", "prune_disk"}
 # A variable holding a "set" -- curly braces with comma-separated values and NO key:value pairs.
@@ -25,9 +28,12 @@ CONFIDENCE_THRESHOLD = 0.8
 # A plain number (a "float", i.e. a number with a decimal point). The model's confidence score
 # has to be at least this high before we trust it enough to act without asking a human first.
 
-RATE_LIMIT_WINDOW_MINUTES = 30
-# Another plain number: how many minutes must pass before the same alarm is allowed to trigger a
-# second automatic fix.
+RATE_LIMIT_WINDOW_MINUTES = int(os.environ.get("RATE_LIMIT_WINDOW_MINUTES", "30"))
+# How many minutes must pass before the same alarm is allowed to trigger a second automatic fix.
+# This is read from the RATE_LIMIT_WINDOW_MINUTES environment variable (Terraform sets it), so the
+# value can change per deployment without editing code: 30 for production, 5 for testing.
+# os.environ.get(name, default) returns the variable's text, or "30" if it isn't set. int() turns
+# that text into a whole number, because environment variables are always text.
 
 REQUIRED_KEYS = {"summary", "root_cause", "confidence", "action", "risk", "evidence"}
 # Another set: the exact fields we require the model's JSON answer to contain.
@@ -110,7 +116,7 @@ def decide(verdict: dict, rate_limited: bool) -> tuple[str, str]:
     if rate_limited:
         # rate_limited is already a plain True/False value, so it can be used directly as a
         # condition.
-        return "approval", "auto-remediation rate limit reached for this alarm in the last 30 minutes"
+        return "approval", "auto-remediation rate limit reached for this alarm in the last rate-limit window"
 
     if confidence >= CONFIDENCE_THRESHOLD and risk == "low":
         # "and" requires BOTH conditions to be true at once: confidence high enough, AND risk is
@@ -126,19 +132,22 @@ def is_rate_limited(recent_items: list[dict], now: dt.datetime | None = None) ->
     # Takes a list of dictionaries (recent audit-log entries) and an optional "now" time to
     # compare against (handy for tests -- you can pass a fixed time instead of the real clock).
     # "= None" gives that second parameter a default value, so callers are allowed to leave it out.
-    """recent_items: prior audit log items for this alarm, each with 'decision' and ISO 'timestamp'."""
+    """recent_items: prior audit log items for this alarm, each with 'decision', 'dry_run' and ISO 'timestamp'."""
     now = now or dt.datetime.utcnow()
     # If the caller passed in a real "now", use it; otherwise (None is falsy) fall back to the
     # actual current time in UTC -- the same "x or y" fallback trick used elsewhere in this file.
     cutoff = now - dt.timedelta(minutes=RATE_LIMIT_WINDOW_MINUTES)
-    # dt.timedelta represents a span of time (here, 30 minutes). Subtracting it from "now" gives
-    # the exact timestamp 30 minutes ago -- anything older than this cutoff is "too old to count".
+    # dt.timedelta represents a span of time (here, the rate-limit window, 30 minutes by default).
+    # Subtracting it from "now" gives the exact timestamp that many minutes ago -- anything older
+    # than this cutoff is "too old to count".
     for item in recent_items:
         # A "for" loop: run the indented block once for every item in the list, one at a time.
-        if item.get("decision") != "auto":
+        if item.get("decision") != "auto" or item.get("dry_run"):
             # .get("decision") reads the "decision" key safely -- if the key is missing, it
             # returns None instead of crashing (unlike item["decision"], which would raise an
-            # error).
+            # error). The "or item.get('dry_run')" part skips dry-run rows too: a dry-run "auto"
+            # never ran an action, so it must not block a real remediation (for example, right
+            # after switching DRY_RUN from true to false).
             continue
             # "continue" skips the rest of this loop pass and jumps straight to the next item.
         ts = item.get("timestamp")
@@ -157,7 +166,7 @@ def is_rate_limited(recent_items: list[dict], now: dt.datetime | None = None) ->
             continue
             # Treat an unparseable timestamp the same as a missing one: skip it and move on.
         if item_time >= cutoff:
-            # Is this item's timestamp at or after the 30-minutes-ago cutoff (i.e. recent)?
+            # Is this item's timestamp at or after the cutoff (i.e. recent)?
             return True
             # As soon as we find ONE recent auto-remediation, we already know the alarm is
             # rate-limited -- no need to keep checking the rest of the list.

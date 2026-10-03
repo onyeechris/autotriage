@@ -20,6 +20,9 @@ import urllib.request
 import uuid
 # Built-in module for generating universally unique IDs, one per incident, so two different
 # triage runs never accidentally share an identifier.
+from decimal import Decimal
+# Decimal is an exact number type from Python's standard library. DynamoDB needs it for
+# non-integer numbers: boto3 refuses plain floats (see to_dynamo_safe below).
 
 import boto3
 # The AWS SDK for Python. This is a third-party library (not part of core Python), but it comes
@@ -241,6 +244,16 @@ def get_recent_audit_items(alarm_name: str) -> list:
     # list if, for some reason, that key isn't present at all.
 
 
+def to_dynamo_safe(value):
+    # Converts a value so DynamoDB will accept it. boto3's DynamoDB resource rejects Python floats
+    # with "TypeError: Float types are not supported", and Claude's verdict contains a float
+    # ("confidence", e.g. 0.85). This crashed every triage run until it was fixed.
+    return json.loads(json.dumps(value, default=str), parse_float=Decimal)
+    # Step 1: json.dumps turns the value into JSON text (default=str turns anything unusual into
+    # text too). Step 2: json.loads turns that text back into Python objects, but with
+    # parse_float=Decimal, so every decimal number comes back as an exact Decimal instead of a float.
+
+
 def write_audit_log(incident_id, alarm_name, verdict, decision, decision_reason, action_result, recovered):
     # No type hints on these parameters -- Python doesn't require them; they're purely optional
     # documentation for humans (and some tools). This function takes several separate pieces of
@@ -254,9 +267,9 @@ def write_audit_log(incident_id, alarm_name, verdict, decision, decision_reason,
             # The sort key: calling our now_iso() helper produces a fresh, current timestamp for
             # exactly when this record is being written.
             "incident_id": incident_id,
-            "verdict": verdict,
-            # DynamoDB can store nested dictionaries directly, so the whole verdict object (or the
-            # {"error": ...} dict used on failure) is stored as-is, no extra conversion needed.
+            "verdict": to_dynamo_safe(verdict),
+            # The whole verdict object (or the {"error": ...} dict used on failure) is stored as a
+            # nested map. Passed through to_dynamo_safe() first so its floats become Decimals.
             "decision": decision,
             "decision_reason": decision_reason,
             "action_result": action_result,
@@ -449,6 +462,14 @@ def lambda_handler(event, context):
         # Pull the alarm's name out, with a fallback in case the field is ever missing.
         alarm_reason = message.get("NewStateReason", "")
         # Pull out CloudWatch's own explanation of why the alarm changed state.
+        if message.get("NewStateValue", "ALARM") != "ALARM":
+            # The alarms also publish their OK transitions (recoveries) to this same topic. Those
+            # are not incidents, so skip them rather than starting a full triage run. The default
+            # of "ALARM" means a message without the field is still treated as an incident.
+            logger.info(json.dumps({"event": "alarm_ignored", "alarm_name": alarm_name, "state": message.get("NewStateValue")}))
+            results.append({"decision": "ignored", "reason": f"state {message.get('NewStateValue')} is not ALARM"})
+            continue
+            # "continue" jumps to the next SNS record without running the triage steps below.
         logger.info(json.dumps({"event": "alarm_received", "alarm_name": alarm_name}))
         # Log a small structured JSON line noting that we've started processing this alarm --
         # useful later for tracing what happened, when reading through CloudWatch Logs.
