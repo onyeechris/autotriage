@@ -20,7 +20,8 @@ resource "aws_cloudwatch_log_metric_filter" "http_5xx" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "http_5xx" {
-  alarm_name          = "${local.name_prefix}-http-5xx-rate"
+  # Named "http-5xx" (not "http-5xx-rate"): AWS refused the older name in the live account.
+  alarm_name          = "${local.name_prefix}-http-5xx"
   alarm_description   = "More than 5 HTTP 5xx responses in 1 minute"
   namespace           = "AutoTriage"
   metric_name         = "HTTP5xxCount"

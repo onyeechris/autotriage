@@ -4,6 +4,13 @@ resource "aws_sns_topic" "triage_trigger" {
   tags = local.common_tags
 }
 
+# Alarm emails: every ALARM/OK transition is also emailed here, so you see incidents as they happen.
+resource "aws_sns_topic_subscription" "trigger_email" {
+  topic_arn = aws_sns_topic.triage_trigger.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
 # The Lambda publishes here for anything that isn't auto-remediated, and for unresolved auto-fixes.
 resource "aws_sns_topic" "escalation" {
   name = "${local.name_prefix}-escalation"

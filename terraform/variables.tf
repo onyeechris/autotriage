@@ -41,7 +41,7 @@ variable "alert_email" {
 variable "anthropic_model" {
   description = "Anthropic model id the triage Lambda calls directly via the Messages API (see https://docs.anthropic.com/en/docs/about-claude/models for current ids)"
   type        = string
-  default     = "claude-3-5-sonnet-20241022"
+  default     = "claude-haiku-4-5-20251001"
 }
 
 variable "anthropic_api_key_parameter_name" {
@@ -53,7 +53,7 @@ variable "anthropic_api_key_parameter_name" {
 variable "dry_run" {
   description = "If true, the triage Lambda reasons and logs normally but never actually sends an SSM command"
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "container_name" {
@@ -63,7 +63,13 @@ variable "container_name" {
 }
 
 variable "post_action_wait_seconds" {
-  description = "How long the Lambda waits after an auto-remediation before re-checking the alarm"
+  description = "How long the Lambda waits after an auto-remediation before re-checking the alarm. Must cover the alarm's evaluation lag (log-based 5xx alarm ~4 min); the Lambda timeout (600s, lambda.tf) must stay above this plus ~150s of other work."
   type        = number
-  default     = 120
+  default     = 360
+}
+
+variable "rate_limit_window_minutes" {
+  description = "Minimum minutes between two real auto-remediations for the same alarm (fix-loop guard). 5 is a test setting; use 30 for production."
+  type        = number
+  default     = 5
 }

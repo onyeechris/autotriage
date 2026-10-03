@@ -7,10 +7,11 @@ Guardrails encoded here (see AUTOTRIAGE.md):
 - invalid or unrecognized LLM output always escalates -- never guess
 """
 import datetime as dt
+import os
 
 ALLOWLISTED_ACTIONS = {"restart_container", "prune_disk"}
 CONFIDENCE_THRESHOLD = 0.8
-RATE_LIMIT_WINDOW_MINUTES = 30
+RATE_LIMIT_WINDOW_MINUTES = int(os.environ.get("RATE_LIMIT_WINDOW_MINUTES", "30"))
 
 REQUIRED_KEYS = {"summary", "root_cause", "confidence", "action", "risk", "evidence"}
 VALID_RISK = {"low", "medium", "high"}
@@ -55,11 +56,12 @@ def decide(verdict: dict, rate_limited: bool) -> tuple[str, str]:
 
 
 def is_rate_limited(recent_items: list[dict], now: dt.datetime | None = None) -> bool:
-    """recent_items: prior audit log items for this alarm, each with 'decision' and ISO 'timestamp'."""
+    """recent_items: prior audit log items for this alarm, each with 'decision', 'dry_run' and ISO 'timestamp'."""
     now = now or dt.datetime.utcnow()
     cutoff = now - dt.timedelta(minutes=RATE_LIMIT_WINDOW_MINUTES)
     for item in recent_items:
-        if item.get("decision") != "auto":
+        # Dry-run "auto" decisions never ran an action, so they must not block a real remediation.
+        if item.get("decision") != "auto" or item.get("dry_run"):
             continue
         ts = item.get("timestamp")
         if not ts:

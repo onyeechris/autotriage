@@ -62,7 +62,11 @@ def get_recent_metrics(cloudwatch_client, instance_id: str) -> str:
                 "Metric": {
                     "Namespace": "CWAgent",
                     "MetricName": "disk_used_percent",
-                    "Dimensions": [{"Name": "InstanceId", "Value": instance_id}, {"Name": "path", "Value": "/"}],
+                    "Dimensions": [
+                        {"Name": "InstanceId", "Value": instance_id},
+                        {"Name": "path", "Value": "/"},
+                        {"Name": "fstype", "Value": "xfs"},
+                    ],
                 },
                 "Period": 300,
                 "Stat": "Average",
@@ -82,16 +86,20 @@ def get_recent_metrics(cloudwatch_client, instance_id: str) -> str:
         },
     ]
     try:
+        # CloudWatch returns newest-first by default; ask for oldest-first so the trend reads correctly.
         response = cloudwatch_client.get_metric_data(
-            MetricDataQueries=queries, StartTime=start_time, EndTime=end_time
+            MetricDataQueries=queries, StartTime=start_time, EndTime=end_time, ScanBy="TimestampAscending"
         )
     except Exception as exc:  # noqa: BLE001 - best-effort context, never fail triage over metrics
         return f"(failed to fetch metrics: {exc})"
 
     lines = []
     for result in response.get("MetricDataResults", []):
-        values = ", ".join(f"{v:.1f}" for v in result.get("Values", []))
-        lines.append(f"{result['Id']}: [{values or 'no data points'}]")
+        points = ", ".join(
+            f"{ts:%H:%M}={v:.1f}" for ts, v in zip(result.get("Timestamps", []), result.get("Values", []))
+        )
+        latest = f"latest={result['Values'][-1]:.1f}" if result.get("Values") else "latest=none"
+        lines.append(f"{result['Id']} ({latest}), oldest->newest UTC: [{points or 'no data points'}]")
     return "\n".join(lines)
 
 

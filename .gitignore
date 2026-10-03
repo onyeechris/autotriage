@@ -1,6 +1,6 @@
 .idea/
 .venv/
-
+env.sh
 # Terraform
 terraform/.terraform/
 terraform/build/

@@ -61,8 +61,8 @@ app/
 
 ### 4. Guardrails
 - Lambda IAM: only `ssm:SendCommand` on tagged instances, only the 2 pre-defined SSM documents; never arbitrary shell
-- `DRY_RUN=true` env var
-- Max 1 auto-remediation per alarm per 30 min (no fix loops)
+- `DRY_RUN` env var (Terraform default `false`; `true` for a rehearsal)
+- Max 1 auto-remediation per alarm per `RATE_LIMIT_WINDOW_MINUTES` (30 by default, 5 for testing; no fix loops)
 - Invalid LLM JSON → escalate, never guess
 
 ## 60-minute plan

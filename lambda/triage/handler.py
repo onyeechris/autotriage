@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from decimal import Decimal
 
 import boto3
 
@@ -114,13 +115,18 @@ def get_recent_audit_items(alarm_name: str) -> list:
     return response.get("Items", [])
 
 
+def to_dynamo_safe(value):
+    # boto3's DynamoDB resource rejects Python floats (e.g. the model's confidence); Decimal is the supported type.
+    return json.loads(json.dumps(value, default=str), parse_float=Decimal)
+
+
 def write_audit_log(incident_id, alarm_name, verdict, decision, decision_reason, action_result, recovered):
     dynamodb_table.put_item(
         Item={
             "alarm_name": alarm_name,
             "timestamp": now_iso(),
             "incident_id": incident_id,
-            "verdict": verdict,
+            "verdict": to_dynamo_safe(verdict),
             "decision": decision,
             "decision_reason": decision_reason,
             "action_result": action_result,
@@ -232,6 +238,11 @@ def lambda_handler(event, context):
         message = json.loads(record["Sns"]["Message"])
         alarm_name = message.get("AlarmName", "unknown-alarm")
         alarm_reason = message.get("NewStateReason", "")
+        # The alarms also publish OK transitions to this topic (recoveries); only ALARM needs triage.
+        if message.get("NewStateValue", "ALARM") != "ALARM":
+            logger.info(json.dumps({"event": "alarm_ignored", "alarm_name": alarm_name, "state": message.get("NewStateValue")}))
+            results.append({"decision": "ignored", "reason": f"state {message.get('NewStateValue')} is not ALARM"})
+            continue
         logger.info(json.dumps({"event": "alarm_received", "alarm_name": alarm_name}))
         try:
             result = handle_alarm(alarm_name, alarm_reason)

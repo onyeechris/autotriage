@@ -25,7 +25,8 @@ fixes it automatically. Concretely, it's built from three cooperating pieces:
    how risky a fix would be, and which (if any) of exactly two pre-approved fixes to apply.
 3. **Something that keeps it honest.** A policy gate only lets that verdict auto-execute if
    confidence and risk both clear a bar, and only if the same alarm hasn't already been
-   auto-fixed in the last 30 minutes; the fix itself can only run via one of two pre-defined SSM
+   auto-fixed within the rate-limit window (`RATE_LIMIT_WINDOW_MINUTES`: 30 by default, 5 in the
+   current test deployment); the fix itself can only run via one of two pre-defined SSM
    documents against one specific tagged instance — never an arbitrary command. After acting, the
    Lambda re-checks the alarm itself rather than trusting the fix worked, escalates to a human by
    email whenever it's not confident or the fix didn't hold, and writes a permanent record of
@@ -87,7 +88,7 @@ Walk through one concrete case: someone calls `POST /chaos/500`.
    — the Lambda never tries to interpret or fix malformed model output.
 
 10. **The policy gate decides what happens next.** `policy.decide` looks at the verdict plus
-    whether this alarm was already auto-remediated in the last 30 minutes
+    whether this alarm was already auto-remediated within the rate-limit window
     (`policy.is_rate_limited`, backed by a DynamoDB query). Only `confidence >= 0.8` **and**
     `risk == "low"` **and** not rate-limited gets to run automatically. Everything else goes to
     a human via the escalation SNS topic (email, in this build).
@@ -95,11 +96,11 @@ Walk through one concrete case: someone calls `POST /chaos/500`.
 11. **If auto-approved, the fix actually runs.** `actions.run_action` calls
     `ssm_client.send_command`, targeting the one tagged EC2 instance with one of exactly two SSM
     documents (`restart-container.yml` or `prune-disk.yml`) — never an arbitrary shell command.
-    If `DRY_RUN=true` (the default), this step is skipped and just recorded as `"status":
+    If `DRY_RUN=true` (the Terraform default is now `false`; use `true` to rehearse), this step is skipped and just recorded as `"status":
     "dry_run"`.
 
-12. **The Lambda waits, then checks its work.** `time.sleep(POST_ACTION_WAIT_SECONDS)` (120s by
-    default), then `alarm_recovered()` calls `cloudwatch:DescribeAlarms` and checks whether the
+12. **The Lambda waits, then checks its work.** `time.sleep(POST_ACTION_WAIT_SECONDS)` (360s by
+    in the current build — log-based alarms take about 4 minutes to clear after a restart), then `alarm_recovered()` calls `cloudwatch:DescribeAlarms` and checks whether the
     same alarm has settled back to `OK`. If not, it escalates — the fix is not assumed to have
     worked just because the command exited successfully.
 
@@ -271,7 +272,7 @@ know this won't do something dangerous automatically."
   else is `"approval"`.
 - `is_rate_limited(recent_items)` — walks the last 20 audit-log entries for this specific alarm
   (fetched by `handler.get_recent_audit_items`) and returns `True` if any of them was itself an
-  `"auto"` decision within the last 30 minutes. This is what stops a flapping alarm from
+  `"auto"` decision within the rate-limit window. This is what stops a flapping alarm from
   triggering a `restart_container` every single time it fires — the second occurrence within the
   window gets bumped to `"approval"` (human review) instead of just running the same fix again.
 
@@ -370,7 +371,7 @@ Also where the `aws` provider's region is set, from `var.aws_region`.
 Every knob the rest of the config reads. Two have no default and must be supplied at apply time
 — `key_name` (an EC2 key pair that has to already exist in the target account/region; Terraform
 doesn't create one for you here) and `alert_email` (who gets escalation emails). Everything else
-defaults to something reasonable for a quick demo: `us-east-1`, `t3.micro`, `dry_run = true`,
+defaults to something reasonable for a quick demo: `us-east-1`, `t3.micro`, `dry_run = false`,
 a specific Anthropic model id you can override without touching any `.tf` file, and the SSM
 parameter name (`/autotriage/anthropic-api-key`) the Lambda reads its API key from.
 
@@ -447,7 +448,8 @@ The CloudWatch log group, one metric filter, and three alarms — all described 
   `disk_high`'s alarm dimensions include a hardcoded `fstype = "xfs"` (Amazon Linux 2023's
   default root filesystem) matching what's left. If a different AMI or filesystem is ever
   substituted, `fstype` here would need to change to match, or the alarm silently never
-  triggers.
+  triggers. The Lambda's own disk query in `context.py` uses the same three dimensions, so the
+  metrics it shows the model match the alarm.
 - `treat_missing_data = "breaching"` on `container_down` is deliberate and different from the
   other two alarms (`"notBreaching"`): if the heartbeat script itself stops running — for
   instance because the whole instance is down, not just the container — there's no data point at
@@ -526,8 +528,8 @@ needing that escaping at all.
 that zip with `handler.lambda_handler` as the entry point, Python 3.12, 256 MB memory, and a
 480-second timeout — sized generously because a single invocation can spend up to ~15s on the
 Logs Insights query, a few seconds on the Anthropic API call, up to 90s polling an SSM command,
-and then a full 120s post-action wait before re-checking the alarm; 480s leaves headroom above
-that worst case. Every environment variable `handler.py` reads (`os.environ[...]`) is set here,
+and then a full 360s post-action wait before re-checking the alarm. Worst case is about 495s, so
+the timeout is 600s (it was 480s until the worst-case arithmetic showed the gap). Every environment variable `handler.py` reads (`os.environ[...]`) is set here,
 pulling real values from other resources — the log group's actual name, the instance's actual
 ID, the bucket's actual name, the Anthropic API key parameter's actual name, and so on — so
 nothing in the Lambda code hardcodes a resource name that Terraform might change.
@@ -559,9 +561,9 @@ have to go find in the AWS console to verify the system end to end.
   `policy.py` or `handler.py`.
 - **The blast radius of automation is bounded in three independent ways at once**: an IAM policy
   that can only target two named documents and one named instance, a policy-gate confidence/risk
-  threshold, and a 30-minute rate limiter — any one of them failing doesn't remove the other two.
+  threshold, and a rate limiter (30 minutes by default) — any one of them failing doesn't remove the other two.
 - **`DRY_RUN` exercises the entire decision pipeline**, not a mocked-out version of it — the only
   thing it skips is the actual `ssm:SendCommand` call and the subsequent wait. Everything else
   (gathering context, calling Claude, validating, gating, logging, writing the RCA) runs for
   real, which is what makes it possible to demo and debug the whole system safely before ever
-  flipping `dry_run = false`.
+  flipping `dry_run = false` (the default is now `false`, so rehearse with `-var dry_run=true` first).

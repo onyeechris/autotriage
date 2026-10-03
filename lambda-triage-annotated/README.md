@@ -10,6 +10,12 @@ in the order listed in **Reading order**, since each one builds on ideas from th
 
 ---
 
+> **Note:** this folder is an annotated *teaching copy*. It is not what's deployed. The deployed
+> source is `lambda/triage/`, which has later fixes this copy doesn't: floats are converted to
+> `Decimal` before the DynamoDB write, OK notifications are ignored, metrics are read oldest-first
+> with timestamps, the disk query includes `fstype`, and the rate-limit window is configurable.
+> See the "What changed" section of `aws_readme.md`.
+
 ## What this folder is, in one paragraph
 
 This is the code for one AWS Lambda function. A Lambda function is just "a chunk of code AWS

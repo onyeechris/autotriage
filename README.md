@@ -27,7 +27,8 @@ autotriage/
 ├── lambda/triage/  # handler.py, policy.py, actions.py, context.py, prompts.py
 ├── ssm/            # restart-container.yml, prune-disk.yml (SSM Command documents)
 ├── runbooks/       # runbook.md — the only source of truth the LLM is told to trust
-└── terraform/      # all AWS infra
+├── terraform/      # all AWS infra (Terraform path)
+└── aws_readme.md   # how to build everything: Terraform, AWS CLI, or the console
 ```
 
 ## What each failure mode looks like
@@ -45,18 +46,20 @@ autotriage/
 
 - Lambda IAM only allows `ssm:SendCommand` on the two named SSM documents and this one tagged
   instance — never arbitrary shell.
-- `DRY_RUN=true` by default (Terraform variable `dry_run`): the Lambda reasons, decides, and
-  logs normally, but never actually sends the SSM command.
-- At most one auto-remediation per alarm per 30 minutes (`policy.is_rate_limited`), so a
-  persistent problem gets escalated instead of retried in a loop.
+- `DRY_RUN` (Terraform variable `dry_run`, default `false`): when `true`, the Lambda reasons,
+  decides, and logs normally, but never actually sends the SSM command. Use it for a rehearsal.
+- At most one auto-remediation per alarm per `RATE_LIMIT_WINDOW_MINUTES` (`policy.is_rate_limited`;
+  30 by default, 5 in the current test deployment), so a persistent problem gets escalated instead
+  of retried in a loop. Dry-run decisions don't count against the limit.
+- Recovery notifications (alarm → OK) are ignored; only ALARM transitions start a triage run.
 - Invalid or unparseable LLM output always escalates — the Lambda never guesses (`policy.validate_verdict`).
 - Auto-remediation requires `confidence >= 0.8` **and** `risk == "low"`; anything else routes to
   human approval via the escalation SNS topic/email.
 
 ## Deploying
 
-Prerequisites: Terraform >= 1.5, AWS credentials for the target account, an existing EC2 key
-pair in the target region, and an [Anthropic API key](https://console.anthropic.com/).
+Full instructions for all three routes (Terraform, AWS CLI, and the console) are in
+**[`aws_readme.md`](aws_readme.md)**. Quick start with Terraform:
 
 ```bash
 cd terraform
@@ -64,448 +67,18 @@ terraform init
 terraform apply \
   -var="key_name=<your-ec2-key-pair-name>" \
   -var="alert_email=<you@example.com>" \
-  -var="ssh_ingress_cidr=<your-ip>/32"
-```
+  -var="ssh_ingress_cidr=<your-ip>/32" \
+  -var="app_ingress_cidr=<your-ip>/32" \
+  -var="dry_run=true"        # rehearse first; flip to false once you trust the decisions
 
-Terraform creates the SSM parameter that holds the Anthropic API key, but deliberately never
-writes the real key into it (Terraform state is not a safe place for a live secret). Set the
-real value once, after the first apply, directly via the AWS CLI:
-
-```bash
+# Terraform creates the API key parameter with a placeholder. Set the real key out-of-band:
 aws ssm put-parameter \
-  --name "$(terraform -chdir=terraform output -raw anthropic_api_key_parameter_name)" \
-  --type SecureString \
-  --value "sk-ant-..." \
-  --overwrite
+  --name "$(terraform output -raw anthropic_api_key_parameter_name)" \
+  --type SecureString --value "sk-ant-..." --overwrite
 ```
 
-`dry_run` defaults to `true`. Flip it once you've watched a full dry-run cycle end to end:
-
-```bash
-terraform apply -var="dry_run=false" ... # plus the vars above
-```
-
-The instance takes a couple of minutes to finish `user_data` (installing Docker, the CloudWatch
-agent, and building/starting the app container) before `/health` responds.
-
-## Building it by hand in the AWS Console (no Terraform)
-
-Everything below creates the exact same resources as `terraform apply`, click by click, in the
-order each resource's dependencies force you into. Resource names match what Terraform would
-have created, so the two approaches are drop-in equivalents — and so you can cross-reference
-`README_exp.md`, which explains *why* each of these exists, while you click through this.
-
-Fill in as you go: `<REGION>` (e.g. `us-east-1`), `<ACCOUNT_ID>` (12-digit, top-right of the
-console), `<YOUR_IP>` (your own public IP, for security group rules), and `<KEY_PAIR>` (an
-existing EC2 key pair in that region — EC2 → Key Pairs → Create key pair, if you don't have one).
-
-### 1. S3 bucket — RCA reports + runbook
-
-**S3 → Buckets → Create bucket**
-- Bucket name: `autotriage-artifacts-<ACCOUNT_ID>` (must be globally unique account-wide)
-- Region: `<REGION>`
-- Block all public access: leave **on** (default)
-- Default encryption: **SSE-S3** (`AES256`)
-- Create bucket
-
-Inside the new bucket: **Create folder** named `runbooks/`, then **Upload** your local
-`runbooks/runbook.md` into it, so the object key ends up as `runbooks/runbook.md`.
-
-### 2. DynamoDB table — audit log
-
-**DynamoDB → Tables → Create table**
-- Table name: `autotriage-audit-log`
-- Partition key: `alarm_name` (String)
-- Sort key: `timestamp` (String)
-- Table settings: **Customize** → Read/write capacity: **On-demand**
-- Create table
-
-### 3. SNS topics — trigger + escalation
-
-**SNS → Topics → Create topic** (×2, both type **Standard**):
-- `autotriage-triage-trigger` — alarms publish here, the Lambda subscribes
-- `autotriage-escalation` — the Lambda publishes here, a human subscribes
-
-Open `autotriage-escalation` → **Create subscription** → Protocol: **Email** → Endpoint: your
-address → Create subscription, then check your inbox and click **Confirm subscription**. No
-messages will arrive until that's confirmed.
-
-### 4. IAM role — EC2 instance
-
-**IAM → Roles → Create role**
-- Trusted entity type: **AWS service** → Use case: **EC2**
-- Attach policies: `AmazonSSMManagedInstanceCore` and `CloudWatchAgentServerPolicy`
-- Role name: `autotriage-ec2-role` → Create role
-
-(Attaching this role to an instance auto-creates a matching instance profile — there's no
-separate "instance profile" object to create by hand in the console the way Terraform has one.)
-
-### 5. Security group
-
-**EC2 → Security Groups → Create security group**
-- Name: `autotriage-app-sg`, VPC: your default VPC
-- Inbound rules: SSH (22) from `<YOUR_IP>/32`; Custom TCP (8000) from `<YOUR_IP>/32` (or
-  `0.0.0.0/0` if you want to hit it from anywhere for the demo)
-- Outbound rules: leave the default **All traffic → 0.0.0.0/0**
-- Create security group
-
-### 6. SSM documents — the only two remediations that can ever run
-
-**Systems Manager → Documents → Owned by me → Create document → Command document**, twice:
-
-- Name `autotriage-restart-container`, Target type `/AWS::EC2::Instance`, Document type
-  **Command**. Switch the content editor to **YAML** and paste in the contents of
-  `ssm/restart-container.yml` verbatim. Create document.
-- Name `autotriage-prune-disk`, same settings, contents of `ssm/prune-disk.yml`.
-
-### 7. Launch the EC2 instance
-
-**EC2 → Instances → Launch instance**
-- Name: `autotriage-app`
-- AMI: **Amazon Linux 2023** (search "Amazon Linux 2023" in Quick Start)
-- Instance type: `t3.micro`
-- Key pair: `<KEY_PAIR>`
-- Network settings → Select existing security group: `autotriage-app-sg`
-- Advanced details → IAM instance profile: `autotriage-ec2-role`
-- Advanced details → User data — paste this (fill in `<REGION>`):
-
-  ```bash
-  #!/bin/bash
-  set -euxo pipefail
-  exec > >(tee /var/log/autotriage-user-data.log) 2>&1
-
-  dnf update -y
-  dnf install -y docker unzip jq cronie
-  systemctl enable --now docker
-  systemctl enable --now crond
-
-  if ! command -v aws >/dev/null 2>&1; then
-    curl -sSL "https://awscliv2.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
-    unzip -q /tmp/awscliv2.zip -d /tmp
-    /tmp/aws/install
-  fi
-
-  curl -sSL "https://amazoncloudwatch-agent-<REGION>.s3.<REGION>.amazonaws.com/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm" \
-    -o /tmp/amazon-cloudwatch-agent.rpm
-  rpm -U /tmp/amazon-cloudwatch-agent.rpm
-
-  mkdir -p /opt/autotriage/app /var/log/autotriage
-  chmod 777 /var/log/autotriage
-  ```
-- Launch instance, and note its **Instance ID** and **Public IPv4 address** from the instance
-  list — you'll need both repeatedly below.
-
-This user data only installs Docker, the AWS CLI, and the CloudWatch agent — unlike the
-Terraform build, it doesn't bake the app's source into the launch config (there's no
-`templatefile()` here to embed it, and pasting raw code into the console's user-data box gets
-unwieldy fast). You'll copy the three app files up yourself in the next step.
-
-### 8. Copy the app up and start it
-
-From your own machine, with the repo checked out locally:
-
-```bash
-scp -i <path-to-KEY_PAIR>.pem app/main.py app/requirements.txt app/Dockerfile \
-  ec2-user@<PUBLIC_IP>:/tmp/
-ssh -i <path-to-KEY_PAIR>.pem ec2-user@<PUBLIC_IP>
-```
-
-Then, on the instance:
-
-```bash
-sudo mkdir -p /opt/autotriage/app
-sudo mv /tmp/main.py /tmp/requirements.txt /tmp/Dockerfile /opt/autotriage/app/
-cd /opt/autotriage/app
-sudo docker build -t autotriage-app:latest .
-sudo docker run -d --name autotriage-app --restart=no -p 8000:8000 \
-  -v /var/log/autotriage:/var/log/autotriage \
-  autotriage-app:latest
-curl -s localhost:8000/health   # sanity check: {"status":"ok"}
-```
-
-### 9. Configure and start the CloudWatch agent
-
-Still on the instance (fill in `<REGION>`):
-
-```bash
-sudo tee /opt/aws/amazon-cloudwatch-agent/etc/config.json > /dev/null <<'CWCONFIG'
-{
-  "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
-  "metrics": {
-    "namespace": "CWAgent",
-    "append_dimensions": { "InstanceId": "${aws:InstanceId}" },
-    "metrics_collected": {
-      "disk": {
-        "measurement": ["used_percent"],
-        "resources": ["/"],
-        "drop_device": true,
-        "metrics_collection_interval": 60
-      },
-      "mem": {
-        "measurement": ["mem_used_percent"],
-        "metrics_collection_interval": 60
-      }
-    }
-  },
-  "logs": {
-    "logs_collected": {
-      "files": {
-        "collect_list": [
-          {
-            "file_path": "/var/log/autotriage/app.log",
-            "log_group_name": "/autotriage/app",
-            "log_stream_name": "{instance_id}/app",
-            "timestamp_format": "%Y-%m-%dT%H:%M:%SZ"
-          }
-        ]
-      }
-    }
-  }
-}
-CWCONFIG
-
-sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-  -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
-```
-
-The `/autotriage/app` log group is created automatically the first time the agent ships a line
-to it — no need to pre-create it, though you can (CloudWatch → Log groups → Create log group)
-if you'd rather set its retention before any data lands.
-
-### 10. Container heartbeat (the container-down alarm has nothing to watch without this)
-
-Still on the instance:
-
-```bash
-sudo tee /etc/default/autotriage > /dev/null <<ENVFILE
-CONTAINER_NAME=autotriage-app
-AWS_REGION=<REGION>
-ENVFILE
-
-sudo tee /opt/autotriage/heartbeat.sh > /dev/null <<'HEARTBEAT'
-#!/bin/bash
-set -euo pipefail
-. /etc/default/autotriage
-INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-RUNNING=$(docker ps -q -f "name=^$CONTAINER_NAME$" -f status=running)
-if [ -n "$RUNNING" ]; then VALUE=1; else VALUE=0; fi
-aws cloudwatch put-metric-data --region "$AWS_REGION" --namespace AutoTriage \
-  --metric-name ContainerRunning --dimensions InstanceId=$INSTANCE_ID --value $VALUE
-HEARTBEAT
-sudo chmod +x /opt/autotriage/heartbeat.sh
-
-echo "* * * * * root /opt/autotriage/heartbeat.sh >> /var/log/autotriage-heartbeat.log 2>&1" \
-  | sudo tee /etc/cron.d/autotriage-heartbeat > /dev/null
-sudo chmod 644 /etc/cron.d/autotriage-heartbeat
-```
-
-Give it a minute, then confirm data is flowing: **CloudWatch → All metrics → AutoTriage** should
-show `ContainerRunning`, and — once the CloudWatch agent has had a minute to report too —
-**CloudWatch → All metrics → CWAgent** should show `disk_used_percent`.
-
-### 11. Log metric filter + all three alarms
-
-**CloudWatch → Log groups → `/autotriage/app` → Metric filters tab → Create metric filter**
-- Filter pattern: `{ $.status_code = 500 }`
-- Filter name: `autotriage-http-5xx`
-- Metric namespace: `AutoTriage`, Metric name: `HTTP5xxCount`, Metric value: `1`, Default
-  value: `0`
-- Create metric filter
-
-**CloudWatch → Alarms → Create alarm**, three times:
-
-| | Namespace / metric | Dimensions | Statistic, period | Threshold | Evaluation periods | Missing data |
-|---|---|---|---|---|---|---|
-| `autotriage-http-5xx-rate` | `AutoTriage` / `HTTP5xxCount` | — | Sum, 1 min | `>` 5 | 1 | Not breaching |
-| `autotriage-container-down` | `AutoTriage` / `ContainerRunning` | `InstanceId=<INSTANCE_ID>` | Minimum, 1 min | `<` 1 | 2 | **Breaching** |
-| `autotriage-disk-high` | `CWAgent` / `disk_used_percent` | `InstanceId=<INSTANCE_ID>, path=/, fstype=xfs` | Average, 1 min | `>` 85 | 2 | Not breaching |
-
-For each: under **Configure actions**, set the "In alarm" action to **Send a notification to an
-SNS topic** → `autotriage-triage-trigger` (add the same for "OK", so you also see it clear).
-
-Two things that trip people up here:
-- The `disk_used_percent` metric only shows up in the metric picker once the agent has actually
-  published a data point — if you don't see it yet, wait a minute and refresh.
-- Its dimensions must match **exactly** what the agent emits. `drop_device: true` in the agent
-  config (step 9) removes the `device` dimension the agent would otherwise add, leaving
-  `InstanceId`, `path`, and `fstype` — confirm `fstype` really is `xfs` on your instance with
-  `df -T /` if the alarm sits in `INSUFFICIENT_DATA` after data should have arrived; a
-  mismatched dimension means the alarm is watching a metric that doesn't exist and it will never
-  fire.
-- `autotriage-container-down` treating missing data as **breaching** is deliberate — if the
-  heartbeat cron stops reporting entirely (e.g. the whole instance is down, not just the
-  container), that absence should itself count as "not running."
-
-### 12. Store the Anthropic API key
-
-**Systems Manager → Parameter Store → Create parameter**
-- Name: `/autotriage/anthropic-api-key`
-- Type: **SecureString** (use the default `aws/ssm` KMS key)
-- Value: your real [Anthropic API key](https://console.anthropic.com/)
-- Create parameter
-
-The Lambda reads this parameter (decrypted) once per cold start rather than having the key baked
-into an environment variable in plaintext.
-
-### 13. IAM role — triage Lambda
-
-**IAM → Roles → Create role**
-- Trusted entity type: **AWS service** → Use case: **Lambda**
-- Attach policy: `AWSLambdaBasicExecutionRole`
-- Role name: `autotriage-triage-lambda-role` → Create role
-
-Open the new role → **Add permissions → Create inline policy → JSON tab**, paste this with every
-`<...>` placeholder filled in, then name it `autotriage-triage-lambda-policy` and save:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "ReadAppLogs",
-      "Effect": "Allow",
-      "Action": ["logs:StartQuery", "logs:GetQueryResults", "logs:StopQuery", "logs:DescribeLogGroups"],
-      "Resource": "*"
-    },
-    {
-      "Sid": "ReadMetricsAndAlarms",
-      "Effect": "Allow",
-      "Action": ["cloudwatch:GetMetricData", "cloudwatch:DescribeAlarms"],
-      "Resource": "*"
-    },
-    {
-      "Sid": "RunbookAndRca",
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject"],
-      "Resource": "arn:aws:s3:::autotriage-artifacts-<ACCOUNT_ID>/*"
-    },
-    {
-      "Sid": "AuditLog",
-      "Effect": "Allow",
-      "Action": ["dynamodb:PutItem", "dynamodb:Query"],
-      "Resource": "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/autotriage-audit-log"
-    },
-    {
-      "Sid": "Escalate",
-      "Effect": "Allow",
-      "Action": "sns:Publish",
-      "Resource": "arn:aws:sns:<REGION>:<ACCOUNT_ID>:autotriage-escalation"
-    },
-    {
-      "Sid": "ReadAnthropicApiKey",
-      "Effect": "Allow",
-      "Action": ["ssm:GetParameter"],
-      "Resource": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/autotriage/anthropic-api-key"
-    },
-    {
-      "Sid": "DecryptAnthropicApiKey",
-      "Effect": "Allow",
-      "Action": ["kms:Decrypt"],
-      "Resource": "*"
-    },
-    {
-      "Sid": "RunRemediation",
-      "Effect": "Allow",
-      "Action": ["ssm:SendCommand"],
-      "Resource": [
-        "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:document/autotriage-restart-container",
-        "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:document/autotriage-prune-disk",
-        "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:instance/<INSTANCE_ID>"
-      ]
-    },
-    {
-      "Sid": "ReadRemediationResult",
-      "Effect": "Allow",
-      "Action": ["ssm:GetCommandInvocation"],
-      "Resource": "*"
-    }
-  ]
-}
-```
-
-This is the same policy `terraform/iam.tf` generates — the console just needs literal ARNs where
-Terraform could reference other resources by name. `DecryptAnthropicApiKey` uses `"*"` rather
-than a specific key ARN because the parameter above uses the AWS-managed `aws/ssm` key, and IAM
-doesn't support scoping `kms:Decrypt` to a key by its alias; `ReadAnthropicApiKey` above it is
-what actually limits which secret can be read.
-
-### 14. Package and create the Lambda function
-
-Locally, zip the Lambda source (the console needs a `.zip`, not a folder):
-
-```bash
-cd lambda/triage
-zip -r ../../triage_lambda.zip . -x "requirements.txt" -x "README.md"
-cd ../..
-```
-
-**Lambda → Functions → Create function**
-- Author from scratch, name `autotriage-triage`, runtime **Python 3.12**
-- Permissions → Use an existing role → `autotriage-triage-lambda-role`
-- Create function
-
-Then:
-- **Code** tab → **Upload from** → **.zip file** → select `triage_lambda.zip` → Save
-- **Runtime settings → Edit** → Handler: `handler.lambda_handler` → Save
-- **Configuration → General configuration → Edit** → Memory: `256` MB, Timeout: `8` min `0` sec
-  (480s — covers the Logs Insights query, the Anthropic API call, up to 90s of SSM polling, and
-  the 120s post-action wait) → Save
-- **Configuration → Environment variables → Edit**, add:
-
-  | Key | Value |
-  |---|---|
-  | `LOG_GROUP_NAME` | `/autotriage/app` |
-  | `INSTANCE_ID` | `<INSTANCE_ID>` |
-  | `S3_BUCKET` | `autotriage-artifacts-<ACCOUNT_ID>` |
-  | `RUNBOOK_KEY` | `runbooks/runbook.md` |
-  | `DYNAMODB_TABLE` | `autotriage-audit-log` |
-  | `ANTHROPIC_MODEL` | `claude-3-5-sonnet-20241022` (or whichever model you're using) |
-  | `ANTHROPIC_API_KEY_PARAM` | `/autotriage/anthropic-api-key` |
-  | `ESCALATION_TOPIC_ARN` | `arn:aws:sns:<REGION>:<ACCOUNT_ID>:autotriage-escalation` |
-  | `SSM_DOC_RESTART` | `autotriage-restart-container` |
-  | `SSM_DOC_PRUNE` | `autotriage-prune-disk` |
-  | `DRY_RUN` | `true` |
-  | `POST_ACTION_WAIT_SECONDS` | `120` |
-
-### 15. Wire the trigger topic to the Lambda
-
-**Lambda → `autotriage-triage` → Add trigger → SNS → Topic: `autotriage-triage-trigger` → Add.**
-
-This one click does two things Terraform does as two separate resources
-(`aws_sns_topic_subscription` + `aws_lambda_permission`): it subscribes the function to the
-topic, *and* it grants SNS the resource-based permission to actually invoke it. Both are
-required; the console just bundles them.
-
-### 16. Test it
-
-Same as the Terraform path (substitute `<PUBLIC_IP>` for `$APP`):
-
-```bash
-curl -s http://<PUBLIC_IP>:8000/health
-curl -s -X POST http://<PUBLIC_IP>:8000/chaos/500
-```
-
-Then watch: **CloudWatch → Alarms** (fires, then clears), the **DynamoDB table** (one new item
-per incident), the **S3 bucket** under `rca/<alarm-name>/...`, and the Lambda's own **CloudWatch
-Logs** log group for the full trace of what it decided and why.
-
-### Cleanup (console)
-
-Delete in this order — later resources reference earlier ones' names/ARNs, so most of these
-will simply refuse to delete out of order:
-
-1. Lambda function `autotriage-triage` (this also removes its SNS trigger)
-2. SNS subscriptions, then both topics (`autotriage-triage-trigger`, `autotriage-escalation`)
-3. CloudWatch alarms (all three) and the `/autotriage/app` log group (deleting the log group also
-   removes its metric filter)
-4. SSM documents (`autotriage-restart-container`, `autotriage-prune-disk`) and the Parameter
-   Store parameter `/autotriage/anthropic-api-key`
-5. EC2 instance (terminate `autotriage-app`), then the `autotriage-app-sg` security group
-6. IAM roles `autotriage-ec2-role` and `autotriage-triage-lambda-role` (detach/delete their
-   inline and managed policies first if the console asks)
-7. DynamoDB table `autotriage-audit-log`
-8. S3 bucket `autotriage-artifacts-<ACCOUNT_ID>` (empty it first — S3 won't delete a non-empty
-   bucket)
+Then confirm the two email subscriptions sent to `alert_email` (alarm emails and escalations),
+and wait 3–5 minutes for the instance's `user_data` before `/health` responds.
 
 ## Triggering each failure mode
 
@@ -528,7 +101,7 @@ Watch it end to end:
 ## Sample RCA (from a dry run)
 
 ```markdown
-# RCA: autotriage-http-5xx-rate
+# RCA: autotriage-http-5xx
 
 - Incident ID: 3f2c1a8e-...
 - Time: 2026-09-25T18:04:12Z
@@ -580,4 +153,4 @@ cd terraform
 terraform destroy
 ```
 
-(If you built it by hand instead, see "Cleanup (console)" above.)
+(If you built it by hand, see Part E of [`aws_readme.md`](aws_readme.md).)
